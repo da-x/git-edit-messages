@@ -1,9 +1,19 @@
 #!/usr/bin/env python
 
+from optparse import OptionParser
+
+#
+# A helper for adding source control tags to the subject 
+# line of commit messages.
+#
+# For example, adding ' [ISSUE-1]' to the last 3 commits:
+#
+#   git-tag-commits HEAD~2 --add-suffix ISSUE-1
+#
+
 import os
 import sys
 import tempfile
-import re
 import cPickle
 
 EDITOR="EDITOR.TEMP"
@@ -15,7 +25,9 @@ class TempFile(object):
         def __init__(self):
             self.nr_commits = 0
             self.cur_commit = 0
-            self.remove_numbers = False
+            self.remove = ''
+            self.add = ''
+            self.is_suffix = False
 
     @classmethod
     def write(selfclass, v):
@@ -56,22 +68,33 @@ def editor_rebase_todo(filename):
 
 def editor_commit_editmsg(filename):
     info = TempFile.load()
-    f = open(filename)
+    lines = file(filename).read().splitlines()
     output = []
-    for line in f:
-        if not output:
-            m = re.match(r"\[part ([0-9]+)/([0-9]+)\] (.*)", line)
-            if m:
-                line = m.groups(0)[2] + "\n"
-            if not info.remove_numbers:
-                line = "[part %d/%d] %s" % (info.cur_commit,
-                                            info.nr_commits, line)
+    idx = 0
+
+    for line in lines:
+        if idx == 0:
+            if info.remove:
+                for remove in [" [" + info.remove + "]",
+                               "[" + info.remove + "] "]:
+                    if remove in line:
+                        line = line.replace(remove, "")
+            if info.add:
+                add1 = "[" + info.add + "] "
+                add2 = " [" + info.add + "]"
+                if add1 not in line and add2 not in line:
+                    if info.is_suffix:
+                        line += add2
+                    else:
+                        line = add1 + line
         output.append(line)
-    f.close()
+        idx += 1
+
     info.cur_commit += 1
     f = open(filename, "w")
-    f.write(''.join(output))
+    f.write('\n'.join(output))
     f.close()
+
     TempFile.save(info)
 
 def main():
@@ -84,12 +107,29 @@ def main():
             editor_commit_editmsg(filename)
         return
 
-    args = sys.argv[1:]
+    parser = OptionParser(usage="usage: %prog [options] [files]")
+    parser.add_option(
+        "-r", "--remove",
+        dest="remove")
+
+    parser.add_option(
+        "-a", "--add-suffix",
+        dest="add_suffix")
+
+    parser.add_option(
+        "-A", "--add-prefix",
+        dest="add_prefix")
+
+    (options, args) = parser.parse_args()
+
     info = TempFile.Info()
-    if '--remove-numbers' in args:
-        args.remove('--remove-numbers')
-        info.remove_numbers = True
-    TempFile.tempfile = tempfile.mktemp("git-rebase-numberer")
+    info.remove = options.remove
+    if options.add_suffix:
+        info.is_suffix = True
+        info.add = options.add_suffix
+    if options.add_prefix:
+        info.add = options.add_prefix
+    TempFile.tempfile = tempfile.mktemp("git-tag-commits")
     TempFile.save(info)
     try:
         os.putenv("GIT_EDITOR", sys.argv[0] + " " + EDITOR + " " + TempFile.tempfile)
