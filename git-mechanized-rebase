@@ -1,0 +1,318 @@
+#!/usr/bin/env python
+
+from optparse import OptionParser
+
+import os
+import sys
+import tempfile
+import cPickle
+import re
+
+EDITOR="EDITOR.TEMP"
+
+class State(object):
+    filename = None
+
+    class Info(dict):
+        def __init__(self):
+            self.nr_commits = 0
+            self.cur_commit = 0
+
+    @classmethod
+    def write(selfclass, v):
+        f = open(selfclass.tempfile, "w")
+        f.write(v)
+        f.close()
+
+    @classmethod
+    def read(selfclass):
+        return open(selfclass.tempfile).read()
+
+    @staticmethod
+    def load():
+        info = State.Info()
+        vars(info).update(cPickle.loads(State.read()))
+        return info
+
+    @staticmethod
+    def save(info):
+        State.write(cPickle.dumps(vars(info)))
+
+def cmd_show(state):
+    i = 0
+    for line in state.script:
+        print "%-6s %-6s %s" % ('@' + str(i),
+                                '^' + str(state.nr_commits - i - 1),
+                                line)
+        i += 1
+    print
+
+def resolve_entries(state, entry):
+    if entry[0] == 'single':
+        v = entry[1]
+        if v[0] == '^':
+            return set([state.nr_commits - v[1] - 1])
+    raise Error("could not resolve %r" % (entry, ))
+
+def cmd_swap(state, first, second):
+    first_indices = resolve_entries(state, first)
+    second_indices = resolve_entries(state, second)
+
+    if min(first_indices) > min(second_indices):
+        first_indices, second_indices = second_indices, first_indices
+
+    try:
+        first = [state.script[i] for i in first_indices]
+    except IndexError:
+        raise Error("swap: first term is out of range")
+
+    try:
+        second = [state.script[i] for i in second_indices]
+    except IndexError:
+        raise Error("swap: second term is out of range")
+
+    script = []
+    for idx in xrange(len(state.script)):
+        if idx in second_indices:
+            continue
+        if idx in first_indices:
+            continue
+        script.append(state.script[idx])
+
+    for ridx, line in enumerate(second):
+        script.insert(min(first_indices) + ridx, line)
+
+    for ridx, line in enumerate(first):
+        script.insert(min(second_indices) + len(second) - len(first) + ridx, line)
+
+    state.script = script
+
+COMMAND_DICT = {
+    ":show" : cmd_show,
+    ":swap" : cmd_swap,
+}
+
+def editor_rebase_todo(filename):
+    state = State.load()
+    script = []
+    lines = open(filename).read().splitlines()
+    for line in lines:
+        if line and not line.startswith('#'):
+            script.append(line)
+    state.cur_commit = 1
+    state.nr_commits = len(script)
+
+    state.script = list(script)
+    if state.script == ["noop"]:
+        state.script = []
+
+    for command, params in state.commands:
+        COMMAND_DICT.get(command)(state, *params)
+
+    if state.script == []:
+        state.script = ["noop"]
+
+    if list(state.script) != script:
+        f = open(filename, "w")
+        script_content = '\n'.join(state.script + [''])
+        f.write(script_content)
+        f.close()
+
+    State.save(state)
+
+def editor_commit_editmsg(filename):
+    return
+
+    state = State.load()
+    lines = file(filename).read().splitlines()
+    output = []
+    idx = 0
+
+    for line in lines:
+        output.append(line)
+
+    state.cur_commit += 1
+    f = open(filename, "w")
+    f.write('\n'.join(output))
+    f.close()
+
+    State.save(state)
+
+COMMANDS = """
+    Commands for introspection:
+
+        :show                - print the rebase script at this stage
+
+    Commands for editing the 'rebase interactive' commit list:
+
+        :fixup <+>           - mark commit(s) for fixup
+        :squash <+>          - mark commit(s) for squash
+        :reword <+>          - mark commit(s) for reword (launching your editor)
+        :del <+>             - delete the commit(s) from the list
+        :swap <+> <+>        - swap the two given commit groups, preserving
+                               their internal order (they must not overlap).
+        :top <+>             - take the given commit(s) to the top of the list
+                               (to be picked first)
+        :bottom <+>          - take the given commit(s) to the bottom of the list
+                               (to be picked last)
+        :movepre <+> <+>     - move the given commit(s) in first paramter to be
+		                       before the given commits in the second paramter.
+        :movepost <+> <+>    - move the given commit(s) in first paramter to be
+		                       after the given commit(s) in the second paramter.
+        :insertpre <+> <+>   -
+        :insertpost <+> <+>  -
+
+    Commands for editing the commit themselves, using GSR:
+
+        :gsrc <+> <gsrfunc>  - perform GSR on the commit messages of the
+                               specified commits.
+        :gsrd <+> <gsrfunc>  - perform GSR on the commit diffs of the
+                               specified commits.
+        :gsr <+> <gsrfunc>   - perform GSR on the both the commits diffs and
+                               the commit messages.
+
+    Commands for issue-tracking labeling:
+
+        :labelpre  <+> <str> - add a bracket enclose label to the beginning of
+		                       the given commit(s)' message subject lines.
+        :labelpost <+> <str> - add a bracket enclose label to the end of
+		                       the given commit(s)' message subject lines.
+        :labelrm   <+> <str> - detect the given bracket enclosed label and
+		                       remove it from given commit(s)' message subject
+							   lines.
+"""
+
+class Error(Exception):
+    pass
+
+def parse_range(arg):
+    INT_MATCH = r"(([^]|[@])([0-9]+))"
+
+    m = re.match(INT_MATCH, arg);
+    def int_tuple((_, prefix, nr)):
+        return (prefix, int(nr))
+
+    if m:
+        r = ('single', int_tuple(m.groups(0)))
+        return r
+
+    m = re.match(INT_MATCH + "-" + INT_MATCH,
+                 arg);
+    if m:
+        (a1, a2, a3, b1, b2, b3) = m.groups(0)
+        r = ('range', int_tuple(a1, a2, a3), int_tuple((b1, b2, b3)))
+        return r
+
+    raise Error("invalid commit specifier: %s" % (arg, ))
+
+def parse_mechanize_args(args):
+    args = list(args)
+    orig_args = []
+    if args and not args[0].startswith(':'):
+        orig_args.append(args[0])
+        del args[0]
+
+    command_dict = {}
+    for command_desc in re.findall("(:.*)-", COMMANDS):
+        command_desc = filter(lambda x:x != '', command_desc.strip().split(' '))
+        command_dict[command_desc[0]] = command_desc[1:]
+
+    commands = []
+    while args:
+        cmd_name = args[0]
+        if cmd_name not in command_dict:
+            raise Error("unknown command %s" % (cmd_name, ))
+        del args[0]
+        argdescs = command_dict[cmd_name]
+        if len(argdescs) > len(args):
+            raise Error("not enough arguments for command %s: needed %d, got %d" %
+                        (cmd_name, len(argdescs), len(args)))
+        cmd_args = []
+        for argdesc in argdescs:
+            arg = args[0]
+            parsed_arg = None
+            if argdesc == '<+>':
+                parsed_arg = parse_range(arg)
+
+            cmd_args.append(parsed_arg)
+            del args[0]
+        commands.append((cmd_name, cmd_args))
+    return (orig_args, commands)
+
+def rebase_i_cmdline_relay(orig_args):
+    args = []
+    other_args = []
+    for arg in orig_args:
+        if arg.startswith('-C'):
+            other_args.append(arg)
+        else:
+            args.append(arg)
+
+    def relay(option, opt_str, value, parser, nr):
+        if not hasattr(parser.values, 'proxy'):
+            parser.values.proxy = []
+        parser.values.proxy.append(opt_str)
+        if nr >= 1:
+            parser.values.proxy.append(value)
+
+    parser = OptionParser(usage="usage: %prog [options] [files]")
+    parser.add_option(""   , "--onto", action="callback", callback=relay, callback_args=(1, ), type="str", nargs=1)
+    parser.add_option(""   , "--continue", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--abort", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--keep-empty", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--skip", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--edit-todo", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--stat", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option("-n" , "--no-stat", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option("-p" , "--preserve-merges", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--root", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--autosquash", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--no-autosquash", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--autostash", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--no-ff", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--no-verify", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option(""   , "--verify", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option("-f" , "--force-rebase", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option("--fork-point", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option("--no-fork-point", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option("-q" , "--quiet", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option("-v" , "--verbose", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option("-m" , "--merge", action="callback", callback=relay, callback_args=(0, ))
+    parser.add_option("-s" , "--strategy", action="callback", callback=relay, callback_args=(1, ), type="str", nargs=1)
+    parser.add_option("-S" , "--gpg-sign", action="callback", callback=relay, callback_args=(1, ), type="str", nargs=1)
+    parser.add_option("-X" , "--strategy-option", action="callback", callback=relay, callback_args=(1, ), type="str", nargs=1)
+
+    (options, args) = parser.parse_args(args)
+    options.proxy = getattr(options, "proxy", []) + other_args
+    return (options, args)
+
+def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == EDITOR:
+        State.tempfile = sys.argv[2]
+        filename = sys.argv[3]
+        if filename.endswith('-todo'):
+            try:
+                editor_rebase_todo(filename)
+            except Error, e:
+                print e
+                sys.exit(1)
+
+        if filename.endswith('/COMMIT_EDITMSG'):
+            editor_commit_editmsg(filename)
+        return
+
+    (options, args) = rebase_i_cmdline_relay(sys.argv[1:])
+    (orig_args, commands) = parse_mechanize_args(args)
+    state = State.Info()
+    state.commands = commands
+    State.tempfile = tempfile.mktemp("git-mechanized-rebaseXXXXXX")
+    State.save(state)
+    try:
+        os.putenv("GIT_EDITOR", sys.argv[0] + " " + EDITOR + " " + State.tempfile)
+        cmd = ["git", "rebase", "-i"] + options.proxy + orig_args
+        os.spawnvp(os.P_WAIT, "git", cmd)
+    finally:
+        os.unlink(State.tempfile)
+
+if __name__ == "__main__":
+    main()
