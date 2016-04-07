@@ -56,8 +56,8 @@ where:
       Single commits:
 
         ^<integer>          - a 0-based index in the `rebase --interactive` script,
-                              where the button in the list is index 0, the last
-                              from the  button it 1, and so on.
+                              where the buttom in the list is index 0, the last
+                              from the  buttom it 1, and so on.
         @<integer>          - a 0-based index in the `rebase --interactive` script,
                               where the top of the list is index 0, the next one
                               down is 1 and so on.
